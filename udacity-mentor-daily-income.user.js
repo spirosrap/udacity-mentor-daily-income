@@ -49,6 +49,19 @@
     december: 12,
   });
 
+  function hasDomScaffold() {
+    return !!(document.head && document.body);
+  }
+
+  async function waitForDomScaffold(timeoutMs = 30000) {
+    const started = Date.now();
+    while (!hasDomScaffold()) {
+      if (Date.now() - started > timeoutMs) return false;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return true;
+  }
+
   function formatMoney(n) {
     const safe = Number.isFinite(n) ? n : 0;
     return safe.toLocaleString(undefined, { style: 'currency', currency: 'USD' });
@@ -515,6 +528,7 @@
   function ensureHistoryIframe() {
     let iframe = document.getElementById(IFRAME_ID);
     if (iframe) return iframe;
+    if (!document.body) return null;
 
     iframe = document.createElement('iframe');
     iframe.id = IFRAME_ID;
@@ -572,7 +586,17 @@
     }
 
     // Fallback: hidden iframe (works if the site allows framing and content is same-origin readable).
+    const domOk = await waitForDomScaffold(timeoutMs);
+    if (!domOk) {
+      lastBackgroundError = 'Timed out waiting for the page DOM to initialize.';
+      return null;
+    }
+
     const iframe = ensureHistoryIframe();
+    if (!iframe) {
+      lastBackgroundError = 'Could not create History iframe (page body not available).';
+      return null;
+    }
     const started = Date.now();
     let forcedOnce = false;
 
@@ -611,6 +635,7 @@
   function ensureBar() {
     let bar = document.getElementById(BAR_ID);
     if (bar) return bar;
+    if (!hasDomScaffold()) return null;
 
     bar = document.createElement('div');
     bar.id = BAR_ID;
@@ -827,6 +852,7 @@
 
   function render({ reviews, questions, note }) {
     const bar = ensureBar();
+    if (!bar) return;
     const total = reviews.sum + questions.sum;
 
     const setText = (sel, txt) => {
@@ -1064,42 +1090,75 @@
     }, immediate ? 0 : 250);
   }
 
-  ensureBar();
   // Install discovery hooks as early as possible. With @run-at document-start,
   // this captures API calls during initial app boot.
   installNetworkDiscoveryHooks();
-  // Fire-and-forget initial compute (async safe).
-  recomputeAndRender().catch(() => {});
 
-  const obs = new MutationObserver((mutations) => {
-    const bar = document.getElementById(BAR_ID);
-    const iframe = document.getElementById(IFRAME_ID);
-    if (bar) {
-      const onlyOurUi = mutations.every((m) => {
-        const t = m.target;
-        return (t instanceof Node) && bar.contains(t);
-      });
-      if (onlyOurUi) return;
-    }
-    if (iframe) {
-      const onlyOurFrame = mutations.every((m) => {
-        const t = m.target;
-        return (t instanceof Node) && iframe.contains(t);
-      });
-      if (onlyOurFrame) return;
-    }
-    scheduleRecompute();
-  });
-  obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+  // UI/DOM bootstrapping: on refresh, `document-start` can run before <head>/<body> exist.
+  // If we inject too early, the bar can fail to mount and "disappear".
+  let uiBooted = false;
+  let bodyObserverInstalled = false;
+  let warmupInstalled = false;
+  let domObserverInstalled = false;
 
-  // Also re-check periodically (handles day rollover + cases where iframe loads later).
-  // Quick warm-up loop to catch iframe load ASAP, then settle into 60s.
-  let warmupTicks = 0;
-  const warmup = window.setInterval(() => {
-    warmupTicks += 1;
-    scheduleRecompute();
-    if (warmupTicks >= 20) window.clearInterval(warmup); // ~10s
-  }, 500);
-  window.setInterval(() => scheduleRecompute(), 60_000);
+  function bootUiIfReady() {
+    if (uiBooted) return;
+    if (!hasDomScaffold()) return;
+
+    uiBooted = true;
+    ensureBar();
+
+    // Fire-and-forget initial compute (async safe).
+    recomputeAndRender().catch(() => {});
+
+    if (!bodyObserverInstalled) {
+      bodyObserverInstalled = true;
+      const obs = new MutationObserver((mutations) => {
+        const bar = document.getElementById(BAR_ID);
+        const iframe = document.getElementById(IFRAME_ID);
+        if (bar) {
+          const onlyOurUi = mutations.every((m) => {
+            const t = m.target;
+            return (t instanceof Node) && bar.contains(t);
+          });
+          if (onlyOurUi) return;
+        }
+        if (iframe) {
+          const onlyOurFrame = mutations.every((m) => {
+            const t = m.target;
+            return (t instanceof Node) && iframe.contains(t);
+          });
+          if (onlyOurFrame) return;
+        }
+        scheduleRecompute();
+      });
+      obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+    }
+
+    // Also re-check periodically (handles day rollover + cases where iframe loads later).
+    // Quick warm-up loop to catch iframe load ASAP, then settle into 60s.
+    if (!warmupInstalled) {
+      warmupInstalled = true;
+      let warmupTicks = 0;
+      const warmup = window.setInterval(() => {
+        warmupTicks += 1;
+        scheduleRecompute();
+        if (warmupTicks >= 20) window.clearInterval(warmup); // ~10s
+      }, 500);
+      window.setInterval(() => scheduleRecompute(), 60_000);
+    }
+  }
+
+  // Try immediately, then on DOM milestones, and also via a DOM observer.
+  bootUiIfReady();
+  document.addEventListener('readystatechange', bootUiIfReady);
+  document.addEventListener('DOMContentLoaded', bootUiIfReady, { once: true });
+  window.addEventListener('load', bootUiIfReady, { once: true });
+
+  if (!domObserverInstalled && document.documentElement) {
+    domObserverInstalled = true;
+    const domObs = new MutationObserver(() => bootUiIfReady());
+    domObs.observe(document.documentElement, { childList: true, subtree: true });
+  }
 })();
 
