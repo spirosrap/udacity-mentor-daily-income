@@ -18,17 +18,21 @@
   const BAR_ID = 'tm-udacity-daily-income-bar';
   const IFRAME_ID = 'tm-udacity-history-iframe';
   const DETAILS_KEY = 'tmUdacityDailyIncomeDetailsOpen';
+  const TARGET_DAY_KEY = 'tmUdacityDailyIncomeTargetDay'; // "YYYY-MM-DD" in TODAY_TIME_ZONE terms
   let lastBackgroundError = '';
   let lastStatus = 'loading'; // loading | ready | error
   const DISCOVERY_KEY = 'tmUdacityDailyIncomeApiDiscovery';
   const DISCOVERY_LOG_KEY = 'tmUdacityDailyIncomeApiDiscoveryLog';
+  const DISCOVERY_LOG_MAX_CHARS = 8000;
   const CACHE_KEY = 'tmUdacityDailyIncomeCache';
+  const BEST_LOCK_KEY = 'tmUdacityDailyIncomeBestByDay';
   let recomputeInFlight = false;
   let recomputeQueued = false;
   let lastRenderSignature = '';
   let lastApiFetchAt = 0;
   let discoveryInstalled = false;
   let lastDataSource = 'none'; // api | history | cache | none
+  let lastApiFailure = '';
   const DEFAULT_RIGHT_PX = 14;
   const DEFAULT_BOTTOM_PX = 14;
   const ANCHOR_GAP_PX = 14;
@@ -82,6 +86,49 @@
       m: Number(get('month')),
       d: Number(get('day')),
     };
+  }
+
+  function partsToDayKey(parts) {
+    if (!parts) return '';
+    return `${parts.y}-${String(parts.m).padStart(2, '0')}-${String(parts.d).padStart(2, '0')}`;
+  }
+
+  function parseDayKeyToParts(key) {
+    // key: "YYYY-MM-DD"
+    if (!key) return null;
+    const m = String(key).trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) return null;
+    const y = Number(m[1]);
+    const mo = Number(m[2]);
+    const d = Number(m[3]);
+    if (!Number.isFinite(y) || !Number.isFinite(mo) || !Number.isFinite(d)) return null;
+    if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+    return { y, m: mo, d };
+  }
+
+  function compareYMD(a, b) {
+    // Returns -1 if a<b, 0 if equal, +1 if a>b
+    if (!a || !b) return 0;
+    if (a.y !== b.y) return a.y < b.y ? -1 : 1;
+    if (a.m !== b.m) return a.m < b.m ? -1 : 1;
+    if (a.d !== b.d) return a.d < b.d ? -1 : 1;
+    return 0;
+  }
+
+  function getTargetDayParts() {
+    try {
+      const raw = localStorage.getItem(TARGET_DAY_KEY);
+      const parsed = parseDayKeyToParts(raw);
+      if (parsed) return parsed;
+    } catch (_) {}
+    return getTodayParts(TODAY_TIME_ZONE);
+  }
+
+  function setTargetDayParts(parts) {
+    try {
+      const key = partsToDayKey(parts);
+      if (key) localStorage.setItem(TARGET_DAY_KEY, key);
+    } catch (_) {}
   }
 
   function getPartsForDate(date, timeZone) {
@@ -184,12 +231,233 @@
     return rows;
   }
 
+  function isDisabledish(el) {
+    if (!el) return true;
+    if (el.disabled) return true;
+    const aria = (el.getAttribute && el.getAttribute('aria-disabled')) || '';
+    if (String(aria).toLowerCase() === 'true') return true;
+    const cls = (el.className && String(el.className)) || '';
+    if (/disabled/i.test(cls)) return true;
+    return false;
+  }
+
+  function paginationLabel(el) {
+    if (!el) return '';
+    const t = (el.textContent || '').trim();
+    const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+    const title = (el.getAttribute && el.getAttribute('title')) || '';
+    const rel = (el.getAttribute && el.getAttribute('rel')) || '';
+    const dataTestId = (el.getAttribute && el.getAttribute('data-testid')) || '';
+    return `${t} ${aria} ${title} ${rel} ${dataTestId}`.trim().toLowerCase();
+  }
+
+  function matchesPaginationDirection(el, dir) {
+    const s = paginationLabel(el);
+    if (!s) return false;
+    if (dir === 'next') {
+      if (s.includes('previous') || s.includes('prev')) return false;
+      if (s.includes('newer')) return false;
+      if (s.includes('next')) return true;
+      if (s.includes('go to next')) return true;
+      if (s.includes('navigate next')) return true;
+      // Udacity History uses "Older" / "Newer"
+      if (s.includes('older')) return true;
+      if (s.includes('›') || s.includes('→') || s.includes('chevronright')) return true;
+      if (s.includes('pagination-next') || s.includes('next-page')) return true;
+      return false;
+    }
+    if (dir === 'prev') {
+      if (s.includes('next')) return false;
+      if (s.includes('older')) return false;
+      if (s.includes('previous') || s.includes('prev')) return true;
+      if (s.includes('go to previous')) return true;
+      if (s.includes('navigate previous')) return true;
+      // Udacity History uses "Older" / "Newer"
+      if (s.includes('newer')) return true;
+      if (s.includes('‹') || s.includes('←') || s.includes('chevronleft')) return true;
+      if (s.includes('pagination-prev') || s.includes('prev-page') || s.includes('previous-page')) return true;
+      return false;
+    }
+    return false;
+  }
+
+  function nearestCommonAncestor(a, b) {
+    if (!a || !b) return null;
+    const aAnc = [];
+    let cur = a;
+    while (cur) { aAnc.push(cur); cur = cur.parentElement; }
+    cur = b;
+    while (cur) {
+      if (aAnc.includes(cur)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
+  function uniqElements(list) {
+    const out = [];
+    const seen = new Set();
+    for (const el of list) {
+      if (!el || seen.has(el)) continue;
+      seen.add(el);
+      out.push(el);
+    }
+    return out;
+  }
+
+  function getSectionGridCells(doc, { startHeadingText, endHeadingText }) {
+    const start = findHeadingByTextIn(doc, startHeadingText);
+    if (!start) return [];
+    const end = endHeadingText ? findHeadingByTextIn(doc, endHeadingText) : null;
+    const gridCells = Array.from(doc.querySelectorAll('[role="gridcell"]'));
+    return nodesBetween(start, end, gridCells);
+  }
+
+  async function waitForSectionRows(doc, sectionCfg, rowTerminatorRe, timeoutMs = 15000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const cells = getSectionGridCells(doc, sectionCfg);
+      if (cells && cells.length) {
+        const rows = splitRowsByTerminator(cells, rowTerminatorRe || /^View (review|question)$/i);
+        if (rows.length) return true;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return false;
+  }
+
+  async function waitForPaginationReady(doc, sectionCfg, timeoutMs = 4000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const rowsReady = await waitForSectionRows(doc, sectionCfg, sectionCfg.rowTerminatorRe, 350);
+      if (!rowsReady) {
+        await new Promise((r) => setTimeout(r, 120));
+        continue;
+      }
+      const nextCandidates = collectPaginationCandidates(doc, sectionCfg, 'next');
+      // As soon as at least one candidate exists (enabled or disabled), pagination UI is likely mounted.
+      if (nextCandidates.length > 0) return true;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    return false;
+  }
+
+  function collectPaginationCandidates(doc, sectionCfg, dir) {
+    const start = findHeadingByTextIn(doc, sectionCfg.startHeadingText);
+    if (!start) return [];
+    const end = sectionCfg.endHeadingText ? findHeadingByTextIn(doc, sectionCfg.endHeadingText) : null;
+    const all = Array.from(doc.querySelectorAll('button,[role="button"],a'));
+    const scoped = nodesBetween(start, end, all);
+
+    const gridCells = getSectionGridCells(doc, sectionCfg);
+    const first = gridCells[0] || null;
+    const last = gridCells.length ? gridCells[gridCells.length - 1] : null;
+    const anc = nearestCommonAncestor(first, last);
+    const near = anc ? Array.from(anc.querySelectorAll('button,[role="button"],a')) : [];
+
+    const pooled = uniqElements([...near, ...scoped, ...all]);
+    const matched = pooled.filter((el) => matchesPaginationDirection(el, dir));
+    const score = (el) => {
+      const s = paginationLabel(el);
+      let v = 0;
+      if (dir === 'next') {
+        if (/\bolder\b/.test(s)) v += 80; // Udacity-specific and most reliable
+        if (/\bnext\b/.test(s)) v += 45;
+      } else {
+        if (/\bnewer\b/.test(s)) v += 80; // Udacity-specific and most reliable
+        if (/\bprevious\b|\bprev\b/.test(s)) v += 45;
+      }
+      if (/pagination|page/.test(s)) v += 12;
+      if ((el.tagName || '').toLowerCase() === 'button') v += 8;
+      if (isDisabledish(el)) v -= 100;
+      return v;
+    };
+    return matched.sort((a, b) => score(b) - score(a));
+  }
+
+  function sectionSignature(doc, { startHeadingText, endHeadingText, rowTerminatorRe }) {
+    const start = findHeadingByTextIn(doc, startHeadingText);
+    if (!start) return '';
+    const end = endHeadingText ? findHeadingByTextIn(doc, endHeadingText) : null;
+    const gridCells = Array.from(doc.querySelectorAll('[role="gridcell"]'));
+    const scopedCells = nodesBetween(start, end, gridCells);
+    const terminator = rowTerminatorRe || /^View (review|question)$/i;
+    const rows = splitRowsByTerminator(scopedCells, terminator);
+    if (!rows.length) {
+      // Fallback: sample from both ends, not only the top (top can be static headers).
+      const head = scopedCells.slice(0, 12);
+      const tail = scopedCells.slice(-12);
+      return [...head, ...tail]
+        .map((el) => (el.textContent || '').trim())
+        .filter(Boolean)
+        .join('|');
+    }
+
+    const summarizeRow = (row) => {
+      const earned = row.map(parseMoney).find((n) => n != null) ?? null;
+      const completed = row.map(parseMonthDayYear).find((d) => d != null) ?? null;
+      const dateKey = completed ? `${completed.y}-${String(completed.m).padStart(2, '0')}-${String(completed.d).padStart(2, '0')}` : '';
+      return `${dateKey}|${earned != null ? earned : ''}`;
+    };
+
+    const first = rows[0];
+    const last = rows[rows.length - 1];
+    const mid = rows[Math.floor(rows.length / 2)];
+    return `rows=${rows.length}|first=${summarizeRow(first)}|mid=${summarizeRow(mid)}|last=${summarizeRow(last)}`;
+  }
+
+  async function clickNextAndWait(doc, sectionCfg, nextEl, prevSig, timeoutMs = 4500) {
+    const started = Date.now();
+    try { nextEl.click(); } catch (_) {}
+    while (Date.now() - started < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 250));
+      const sig = sectionSignature(doc, sectionCfg);
+      if (sig && sig !== prevSig) {
+        // Wait for rows to actually appear after a paging click (SPA often clears rows while loading).
+        await waitForSectionRows(doc, sectionCfg, sectionCfg.rowTerminatorRe, 6000);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function clickPrevAndWait(doc, sectionCfg, prevEl, prevSig, timeoutMs = 4500) {
+    const started = Date.now();
+    try { prevEl.click(); } catch (_) {}
+    while (Date.now() - started < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 250));
+      const sig = sectionSignature(doc, sectionCfg);
+      if (sig && sig !== prevSig) {
+        await waitForSectionRows(doc, sectionCfg, sectionCfg.rowTerminatorRe, 6000);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function rewindSectionToFirstPage(doc, sectionCfg) {
+    const MAX_STEPS = 30;
+    let steps = 0;
+    while (steps < MAX_STEPS) {
+      const sig = sectionSignature(doc, sectionCfg);
+      const candidates = collectPaginationCandidates(doc, sectionCfg, 'prev').slice(0, 6);
+      let advanced = false;
+      for (const prev of candidates) {
+        if (!prev || isDisabledish(prev)) continue;
+        const ok = await clickPrevAndWait(doc, sectionCfg, prev, sig);
+        if (ok) { advanced = true; break; }
+      }
+      if (!advanced) return;
+      steps += 1;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  }
+
   function computeSectionSumIn(doc, { startHeadingText, endHeadingText, rowTerminatorRe }) {
     const start = findHeadingByTextIn(doc, startHeadingText);
     if (!start) return { sum: 0, found: false, rowsCounted: 0, rowsSeen: 0 };
     const end = endHeadingText ? findHeadingByTextIn(doc, endHeadingText) : null;
-
-    const today = getTodayParts(TODAY_TIME_ZONE);
+    const targetDay = getTargetDayParts();
 
     const gridCells = Array.from(doc.querySelectorAll('[role="gridcell"]'));
     const scopedCells = nodesBetween(start, end, gridCells);
@@ -197,16 +465,65 @@
 
     let sum = 0;
     let rowsCounted = 0;
+    let maxCompleted = null;
     for (const row of rows) {
       const earned = row.map(parseMoney).find((n) => n != null) ?? null;
       const completed = row.map(parseMonthDayYear).find((d) => d != null) ?? null;
       if (earned == null || !completed) continue;
-      if (!sameYMD(completed, today)) continue;
+      if (!maxCompleted || compareYMD(completed, maxCompleted) > 0) maxCompleted = completed;
+      if (!sameYMD(completed, targetDay)) continue;
       sum += earned;
       rowsCounted += 1;
     }
 
-    return { sum, found: true, rowsCounted, rowsSeen: rows.length };
+    return { sum, found: true, rowsCounted, rowsSeen: rows.length, maxCompleted };
+  }
+
+  async function computeSectionSumPaginatedIn(doc, { startHeadingText, endHeadingText, rowTerminatorRe }) {
+    const targetDay = getTargetDayParts();
+    const sectionCfg = { startHeadingText, endHeadingText, rowTerminatorRe };
+    const MAX_PAGES = 30;
+    let pages = 0;
+    let sum = 0;
+    let rowsCounted = 0;
+    let rowsSeen = 0;
+
+    // Start from the first page so results are accumulated deterministically.
+    await rewindSectionToFirstPage(doc, sectionCfg);
+    // Give the section a short moment to mount pagination controls (Older/Newer) before first compute.
+    await waitForPaginationReady(doc, sectionCfg, 4000);
+    // Ensure the first page rows are actually rendered before computing.
+    await waitForSectionRows(doc, sectionCfg, rowTerminatorRe, 15000);
+
+    while (pages < MAX_PAGES) {
+      const cur = computeSectionSumIn(doc, { startHeadingText, endHeadingText, rowTerminatorRe });
+      if (!cur.found) return cur;
+      sum += cur.sum;
+      rowsCounted += cur.rowsCounted;
+      rowsSeen += cur.rowsSeen;
+
+      // If this page is entirely older than the target day, stop.
+      if (cur.maxCompleted && compareYMD(cur.maxCompleted, targetDay) < 0) break;
+
+      const prevSig = sectionSignature(doc, sectionCfg);
+      let candidates = collectPaginationCandidates(doc, sectionCfg, 'next').slice(0, 6);
+      // If the whole visible page matches target day and we didn't find pagination yet,
+      // wait briefly for the pager to mount to avoid locking into page-1 totals.
+      if (!candidates.length && cur.rowsSeen > 0 && cur.rowsCounted === cur.rowsSeen) {
+        await waitForPaginationReady(doc, sectionCfg, 2500);
+        candidates = collectPaginationCandidates(doc, sectionCfg, 'next').slice(0, 6);
+      }
+      let advanced = false;
+      for (const next of candidates) {
+        if (!next || isDisabledish(next)) continue;
+        const ok = await clickNextAndWait(doc, sectionCfg, next, prevSig);
+        if (ok) { advanced = true; break; }
+      }
+      if (!advanced) break;
+      pages += 1;
+    }
+
+    return { sum, found: true, rowsCounted, rowsSeen, pages: pages + 1 };
   }
 
   function isHistoryRoute() {
@@ -222,9 +539,26 @@
     }
   }
 
-  function isApiReady(discovery) {
-    // Only use API mode when BOTH endpoints exist; otherwise Overview shows partial/0 totals.
-    return !!(discovery?.endpoints?.reviews && discovery?.endpoints?.questions);
+  function hasAnyApiEndpoint(discovery) {
+    const r = discovery?.endpoints?.reviews ? String(discovery.endpoints.reviews) : '';
+    const q = discovery?.endpoints?.questions ? String(discovery.endpoints.questions) : '';
+    return !!(isUsableApiEndpointUrl(r) || isUsableApiEndpointUrl(q));
+  }
+
+  function hasApiEndpoint(discovery, type) {
+    if (!discovery?.endpoints) return false;
+    if (type === 'review') return isUsableApiEndpointUrl(discovery.endpoints.reviews);
+    if (type === 'question') return isUsableApiEndpointUrl(discovery.endpoints.questions);
+    return false;
+  }
+
+  function isUsableApiEndpointUrl(u) {
+    if (!u) return false;
+    const s = String(u);
+    const lower = s.toLowerCase();
+    // Known false-positive endpoint (not payouts/history).
+    if (lower.includes('/certifications') || lower.includes('certifications.json')) return false;
+    return true;
   }
 
   function loadCache() {
@@ -236,22 +570,97 @@
     }
   }
 
-  function saveCache(obj) {
+  function pruneStorageForWrites() {
+    // Keep discovery data bounded so cache writes don't fail under localStorage quota.
     try {
-      localStorage.setItem(CACHE_KEY, JSON.stringify(obj));
+      const log = localStorage.getItem(DISCOVERY_LOG_KEY) || '';
+      if (log.length > DISCOVERY_LOG_MAX_CHARS) {
+        localStorage.setItem(DISCOVERY_LOG_KEY, log.slice(-DISCOVERY_LOG_MAX_CHARS));
+      } else if (log.length > Math.floor(DISCOVERY_LOG_MAX_CHARS * 0.75)) {
+        localStorage.setItem(DISCOVERY_LOG_KEY, log.slice(-Math.floor(DISCOVERY_LOG_MAX_CHARS * 0.5)));
+      }
+    } catch (_) {}
+
+    try {
+      const raw = localStorage.getItem(DISCOVERY_KEY);
+      if (!raw) return;
+      const d = JSON.parse(raw);
+      if (!d || typeof d !== 'object') return;
+      if (Array.isArray(d.candidates) && d.candidates.length > 10) d.candidates = d.candidates.slice(0, 10);
+      if (d.lastParsed && typeof d.lastParsed === 'object' && Array.isArray(d.lastParsed.keyHints) && d.lastParsed.keyHints.length > 12) {
+        d.lastParsed.keyHints = d.lastParsed.keyHints.slice(0, 12);
+      }
+      localStorage.setItem(DISCOVERY_KEY, JSON.stringify(d));
     } catch (_) {}
   }
 
-  function saveDiscovery(obj) {
+  function safeSetLocalStorage(key, value) {
     try {
-      localStorage.setItem(DISCOVERY_KEY, JSON.stringify(obj));
-    } catch (_) {}
+      localStorage.setItem(key, value);
+      return true;
+    } catch (_) {
+      try { pruneStorageForWrites(); } catch (_) {}
+      try {
+        localStorage.setItem(key, value);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+  }
+
+  function saveCache(obj) {
+    try { safeSetLocalStorage(CACHE_KEY, JSON.stringify(obj)); } catch (_) {}
+  }
+
+  function loadBestByDay() {
+    try {
+      const raw = localStorage.getItem(BEST_LOCK_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function saveBestByDay(obj) {
+    try { safeSetLocalStorage(BEST_LOCK_KEY, JSON.stringify(obj || {})); } catch (_) {}
+  }
+
+  function loadBestLock(dayKey) {
+    const all = loadBestByDay();
+    return (all && typeof all === 'object') ? (all[dayKey] || null) : null;
+  }
+
+  function saveBestLock(dayKey, payload) {
+    if (!dayKey || !payload) return;
+    const all = loadBestByDay();
+    const prev = (all && typeof all === 'object') ? (all[dayKey] || null) : null;
+    if (!shouldOverwriteDayCache(prev, payload)) return;
+    const next = {
+      reviews: payload.reviews || 0,
+      questions: payload.questions || 0,
+      countedReviews: payload.countedReviews || 0,
+      countedQuestions: payload.countedQuestions || 0,
+      at: Date.now(),
+    };
+    const merged = (all && typeof all === 'object') ? { ...all, [dayKey]: next } : { [dayKey]: next };
+    const keys = Object.keys(merged).sort((a, b) => (a < b ? 1 : -1));
+    for (const k of keys.slice(31)) delete merged[k];
+    saveBestByDay(merged);
+  }
+
+  function saveDiscovery(obj) {
+    try { safeSetLocalStorage(DISCOVERY_KEY, JSON.stringify(obj)); } catch (_) {}
   }
 
   function logDiscovery(line) {
     try {
       const existing = localStorage.getItem(DISCOVERY_LOG_KEY) || '';
-      localStorage.setItem(DISCOVERY_LOG_KEY, `${existing}\n${new Date().toISOString()} ${line}`.trim());
+      const next = `${existing}\n${new Date().toISOString()} ${line}`.trim();
+      const trimmed = next.length > DISCOVERY_LOG_MAX_CHARS
+        ? next.slice(-DISCOVERY_LOG_MAX_CHARS)
+        : next;
+      safeSetLocalStorage(DISCOVERY_LOG_KEY, trimmed);
     } catch (_) {}
   }
 
@@ -262,9 +671,140 @@
     return undefined;
   }
 
-  function toMoneyNumber(v) {
-    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  function toMoneyNumber(v, hintKey) {
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      // If the field name hints at cents, convert.
+      if (hintKey && typeof hintKey === 'string' && /cent/i.test(hintKey) && Math.abs(v) >= 1) return v / 100;
+      return v;
+    }
     if (typeof v === 'string') return parseMoney(v) ?? (Number.isFinite(Number(v)) ? Number(v) : null);
+    if (Array.isArray(v)) {
+      for (const el of v) {
+        const n = toMoneyNumber(el, hintKey);
+        if (n != null) return n;
+      }
+      return null;
+    }
+    if (v && typeof v === 'object') {
+      // Common shapes: { amount: 12.34, currency: "USD" } / { value: 12.34 } / { cents: 1234 }
+      const amt = toMoneyNumber(v.amount, 'amount');
+      if (amt != null) return amt;
+      const val = toMoneyNumber(v.value, 'value');
+      if (val != null) return val;
+      const cents = toMoneyNumber(v.cents, 'cents');
+      if (cents != null) return cents;
+      const minor = toMoneyNumber(v.minor, 'minor');
+      if (minor != null) return minor;
+    }
+    return null;
+  }
+
+  function scoreAmountKey(key, valNum) {
+    if (valNum == null || !Number.isFinite(valNum)) return -Infinity;
+    const abs = Math.abs(valNum);
+    if (abs === 0) return -5;
+    if (abs > 2000) return -50;
+    let s = 0;
+    const k = String(key || '').toLowerCase();
+    if (k.includes('earned') || k.includes('earning')) s += 40;
+    if (k.includes('payout') || k.includes('payment') || k.includes('paid')) s += 35;
+    if (k.includes('amount') || k.includes('fee') || k.includes('usd') || k.includes('value') || k.includes('total')) s += 15;
+    if (k.includes('cent')) s += 5;
+    if (String(valNum).includes('.')) s += 3;
+    return s;
+  }
+
+  function scoreDateKey(key, dt) {
+    if (!(dt instanceof Date) || Number.isNaN(dt.getTime())) return -Infinity;
+    const t = dt.getTime();
+    const now = Date.now();
+    if (t < Date.UTC(2018, 0, 1) || t > now + 7 * 24 * 3600 * 1000) return -50;
+    let s = 0;
+    const k = String(key || '').toLowerCase();
+    if (k.includes('completed') || k.includes('finished')) s += 40;
+    if (k.includes('submitted') || k.includes('created')) s += 10;
+    if (k.includes('date') || k.includes('time') || k.includes('timestamp') || k.includes('at')) s += 8;
+    return s;
+  }
+
+  function guessAmountAndDateFromObject(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    let bestAmount = null;
+    let bestDate = null;
+    let bestAmountScore = -Infinity;
+    let bestDateScore = -Infinity;
+
+    for (const [k, v] of Object.entries(obj)) {
+      const visit = (val) => {
+        // Amount candidates
+        const n = toMoneyNumber(val, k);
+        const as = scoreAmountKey(k, n);
+        if (as > bestAmountScore) {
+          bestAmountScore = as;
+          bestAmount = n;
+        }
+        // Date candidates
+        const d = tryParseDate(val);
+        const ds = scoreDateKey(k, d);
+        if (ds > bestDateScore) {
+          bestDateScore = ds;
+          bestDate = d;
+        }
+      };
+      if (Array.isArray(v)) {
+        for (const el of v) visit(el);
+      } else {
+        visit(v);
+      }
+    }
+
+    if (bestAmount != null && bestDate) return { earned: bestAmount, date: bestDate };
+    return null;
+  }
+
+  function guessAmountAndDateDeep(root, maxDepth = 4) {
+    if (!root || typeof root !== 'object') return null;
+    let bestAmount = null;
+    let bestDate = null;
+    let bestAmountScore = -Infinity;
+    let bestDateScore = -Infinity;
+
+    const stack = [{ v: root, k: '', depth: 0 }];
+    const seen = new Set();
+    while (stack.length) {
+      const cur = stack.pop();
+      const v = cur.v;
+      const k = cur.k;
+      const depth = cur.depth;
+      if (!v || typeof v !== 'object') continue;
+      if (seen.has(v)) continue;
+      seen.add(v);
+      if (depth > maxDepth) continue;
+
+      if (Array.isArray(v)) {
+        for (const el of v) stack.push({ v: el, k, depth: depth + 1 });
+        continue;
+      }
+
+      for (const [kk, vv] of Object.entries(v)) {
+        const key = kk || k;
+        const n = toMoneyNumber(vv, key);
+        const as = scoreAmountKey(key, n);
+        if (as > bestAmountScore) {
+          bestAmountScore = as;
+          bestAmount = n;
+        }
+        const d = tryParseDate(vv);
+        const ds = scoreDateKey(key, d);
+        if (ds > bestDateScore) {
+          bestDateScore = ds;
+          bestDate = d;
+        }
+        if (vv && typeof vv === 'object') stack.push({ v: vv, k: key, depth: depth + 1 });
+      }
+    }
+
+    if (bestAmount != null && bestDate) return { earned: bestAmount, date: bestDate };
     return null;
   }
 
@@ -278,6 +818,7 @@
   function extractItemsFromAny(payload, fallbackType) {
     // Walk the payload and collect objects that look like history items.
     const items = [];
+    const sigs = new Set();
     const seen = new Set();
 
     const stack = [payload];
@@ -293,16 +834,47 @@
       }
 
       // Try interpret current object as an item.
-      const earnedRaw = getStringish(cur, ['earned', 'amount', 'payout', 'payment', 'compensation', 'fee', 'usd', 'value']);
-      const dateRaw = getStringish(cur, ['completed', 'completedAt', 'completed_at', 'submittedAt', 'submitted_at', 'createdAt', 'created_at', 'finishedAt', 'finished_at', 'date']);
+      const earnedRaw = getStringish(cur, [
+        'earned', 'earning', 'earnings', 'earnedAmount', 'earned_amount',
+        'amount', 'amountUsd', 'amount_usd', 'payout', 'payoutAmount', 'payout_amount',
+        'payment', 'paymentAmount', 'payment_amount', 'compensation', 'fee',
+        'usd', 'value', 'total', 'totalAmount', 'total_amount', 'price', 'rate',
+        'amountCents', 'amount_cents', 'payoutCents', 'payout_cents', 'earnedCents', 'earned_cents',
+      ]);
+      const dateRaw = getStringish(cur, [
+        'completed', 'completedAt', 'completed_at', 'completedOn', 'completed_on', 'completedDate', 'completed_date',
+        'submittedAt', 'submitted_at', 'createdAt', 'created_at', 'finishedAt', 'finished_at',
+        'date', 'timestamp', 'time', 'at',
+      ]);
       const earned = toMoneyNumber(earnedRaw);
       const date = tryParseDate(dateRaw);
       if (earned != null && date) {
-        items.push({
-          earned,
-          completedDate: date,
-          type: classifyItemType(cur, fallbackType),
-        });
+        const type = classifyItemType(cur, fallbackType);
+        const sig = `${type || ''}|${date.getTime()}|${earned}`;
+        if (!sigs.has(sig)) {
+          sigs.add(sig);
+          items.push({
+            earned,
+            completedDate: date,
+            type,
+          });
+        }
+      } else {
+        // Heuristic fallback: find "some amount" + "some date" within the same object.
+        const guessed = guessAmountAndDateFromObject(cur);
+        const deep = guessed || guessAmountAndDateDeep(cur);
+        if (deep) {
+          const type = classifyItemType(cur, fallbackType);
+          const sig = `${type || ''}|${deep.date.getTime()}|${deep.earned}`;
+          if (!sigs.has(sig)) {
+            sigs.add(sig);
+            items.push({
+              earned: deep.earned,
+              completedDate: deep.date,
+              type,
+            });
+          }
+        }
       }
 
       // Continue walk.
@@ -311,8 +883,8 @@
     return items;
   }
 
-  function computeTotalsFromItems(items) {
-    const today = getTodayParts(TODAY_TIME_ZONE);
+  function computeTotalsFromItems(items, targetDayParts) {
+    const target = targetDayParts || getTargetDayParts();
     let reviews = 0;
     let questions = 0;
     let countedReviews = 0;
@@ -320,7 +892,7 @@
 
     for (const it of items) {
       const parts = getPartsForDate(it.completedDate, TODAY_TIME_ZONE);
-      if (!sameYMD(parts, today)) continue;
+      if (!sameYMD(parts, target)) continue;
       if (it.type === 'review') {
         reviews += it.earned;
         countedReviews += 1;
@@ -345,7 +917,7 @@
       if (it.type === 'review') reviewItems += 1;
       else if (it.type === 'question') questionItems += 1;
     }
-    const todayTotals = computeTotalsFromItems(items);
+    const todayTotals = computeTotalsFromItems(items, getTodayParts(TODAY_TIME_ZONE));
     return {
       itemsTotal: items.length,
       reviewItems,
@@ -359,6 +931,29 @@
           }
         : null,
     };
+  }
+
+  function collectKeyHints(payload) {
+    const hints = new Set();
+    const stack = [payload];
+    const seen = new Set();
+    const keyRe = /(earn|payout|pay|amount|comp|fee|usd|value|cent|total|rate|price|completed|finish|submit|create|date|time|timestamp|at)/i;
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== 'object') continue;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      if (Array.isArray(cur)) {
+        for (const v of cur) stack.push(v);
+        continue;
+      }
+      for (const k of Object.keys(cur)) {
+        if (keyRe.test(k)) hints.add(k);
+        stack.push(cur[k]);
+      }
+      if (hints.size >= 40) break;
+    }
+    return Array.from(hints).slice(0, 40);
   }
 
   function installNetworkDiscoveryHooks() {
@@ -390,6 +985,57 @@
     if (origFetch) {
       window.fetch = async (...args) => {
         const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+        const init = (args && args.length > 1 && args[1] && typeof args[1] === 'object') ? args[1] : null;
+        const method = String(init?.method || (typeof args[0] !== 'string' ? (args[0]?.method || '') : '') || 'GET').toUpperCase();
+        const reqHeaders = init?.headers || (typeof args[0] !== 'string' ? args[0]?.headers : null);
+        const isGraphql = typeof url === 'string' && url.includes('/api/pensieve/graphql');
+        let graphqlRequest = null;
+        if (isGraphql && method === 'POST') {
+          try {
+            let bodyText = null;
+            if (typeof init?.body === 'string') bodyText = init.body;
+            // Some apps pass a Request object without init; try clone().
+            if (!bodyText && typeof args[0] !== 'string' && args[0] && typeof args[0].clone === 'function') {
+              try {
+                const cloned = args[0].clone();
+                bodyText = await cloned.text();
+              } catch (_) {}
+            }
+            if (bodyText) {
+              const bodyJson = (() => { try { return JSON.parse(bodyText); } catch (_) { return null; } })();
+              const opName = String(bodyJson?.operationName || '').toLowerCase();
+              const q = String(bodyJson?.query || '').toLowerCase();
+              const inferredGqlType =
+                (opName.includes('review') || q.includes('review')) ? 'review'
+                  : ((opName.includes('question') || q.includes('question')) ? 'question' : 'unknown');
+              graphqlRequest = {
+                at: Date.now(),
+                url,
+                method,
+                inferredType: inferredGqlType,
+                body: bodyJson || { raw: bodyText },
+              };
+              // Best-effort: keep only a couple of headers if present.
+              try {
+                const picked = {};
+                const getHdr = (k) => {
+                  try {
+                    if (!reqHeaders) return null;
+                    if (typeof reqHeaders.get === 'function') return reqHeaders.get(k);
+                    if (typeof reqHeaders === 'object') return reqHeaders[k] || reqHeaders[k.toLowerCase()];
+                  } catch (_) {}
+                  return null;
+                };
+                const ct = getHdr('content-type');
+                if (ct) picked['content-type'] = ct;
+                const csrf = getHdr('x-csrf-token');
+                if (csrf) picked['x-csrf-token'] = csrf;
+                graphqlRequest.headers = picked;
+              } catch (_) {}
+            }
+          } catch (_) {}
+        }
+
         const res = await origFetch(...args);
         try {
           if (interestingUrl(url)) {
@@ -403,6 +1049,12 @@
             d.endpoints = d.endpoints || {};
             d.candidates = Array.isArray(d.candidates) ? d.candidates : [];
             d.best = d.best || { reviews: 0, questions: 0 };
+            d.graphql = d.graphql || {};
+            if (graphqlRequest && graphqlRequest.body) {
+              if (graphqlRequest.inferredType === 'review') d.graphql.reviews = graphqlRequest;
+              else if (graphqlRequest.inferredType === 'question') d.graphql.questions = graphqlRequest;
+              else d.graphql.last = graphqlRequest;
+            }
 
             // Try parse payload (without consuming original).
             const ct = (res.headers.get('content-type') || '').toLowerCase();
@@ -414,6 +1066,7 @@
                   : (urlLower.includes('question') ? 'question' : undefined);
                 const items = extractItemsFromAny(json, inferredType);
                 const summary = summarizeItems(items);
+                const keyHints = collectKeyHints(json);
                 d.lastParsed = {
                   at: Date.now(),
                   url,
@@ -423,6 +1076,7 @@
                   countedReviews: summary.countedReviews,
                   countedQuestions: summary.countedQuestions,
                   sample: summary.sample,
+                  keyHints,
                 };
                 d.candidates.unshift({
                   at: Date.now(),
@@ -439,9 +1093,15 @@
                 if (summary.reviewItems >= 3 && summary.reviewItems >= (d.best.reviews || 0)) {
                   d.best.reviews = summary.reviewItems;
                   d.endpoints.reviews = url;
+                } else if (inferredType === 'review' && !d.endpoints.reviews && !String(url).toLowerCase().includes('certifications')) {
+                  // If the URL clearly looks like the reviews endpoint but there are too few/zero items,
+                  // still record it so API pagination can work.
+                  d.endpoints.reviews = url;
                 }
                 if (summary.questionItems >= 3 && summary.questionItems >= (d.best.questions || 0)) {
                   d.best.questions = summary.questionItems;
+                  d.endpoints.questions = url;
+                } else if (inferredType === 'question' && !d.endpoints.questions) {
                   d.endpoints.questions = url;
                 }
               } catch (_) {}
@@ -485,6 +1145,7 @@
                     : (urlLower.includes('question') ? 'question' : undefined);
                   const items = extractItemsFromAny(json, inferredType);
                   const summary = summarizeItems(items);
+                  const keyHints = collectKeyHints(json);
                   d.lastParsed = {
                     at: Date.now(),
                     url: _url,
@@ -494,6 +1155,7 @@
                     countedReviews: summary.countedReviews,
                     countedQuestions: summary.countedQuestions,
                     sample: summary.sample,
+                    keyHints,
                   };
                   d.candidates.unshift({
                     at: Date.now(),
@@ -508,9 +1170,13 @@
                   if (summary.reviewItems >= 3 && summary.reviewItems >= (d.best.reviews || 0)) {
                     d.best.reviews = summary.reviewItems;
                     d.endpoints.reviews = _url;
+                  } else if (inferredType === 'review' && !d.endpoints.reviews && !String(_url).toLowerCase().includes('certifications')) {
+                    d.endpoints.reviews = _url;
                   }
                   if (summary.questionItems >= 3 && summary.questionItems >= (d.best.questions || 0)) {
                     d.best.questions = summary.questionItems;
+                    d.endpoints.questions = _url;
+                  } else if (inferredType === 'question' && !d.endpoints.questions) {
                     d.endpoints.questions = _url;
                   }
                 } catch (_) {}
@@ -537,10 +1203,12 @@
     iframe.tabIndex = -1;
     iframe.style.cssText = [
       'position: fixed',
-      'left: -10000px',
+      // Keep it off-screen but "full size" so responsive layouts + pagination controls render normally.
+      // If this is tiny (e.g., 1px), the app can switch to mobile UI and hide controls.
+      'left: -5000px',
       'top: 0',
-      'width: 1px',
-      'height: 1px',
+      'width: 1400px',
+      'height: 900px',
       'opacity: 0',
       'pointer-events: none',
       'border: 0',
@@ -564,28 +1232,8 @@
   }
 
   async function waitForHistoryDoc(timeoutMs = 30000) {
-    // Preferred: fetch the History HTML with cookies and parse it.
-    // This avoids iframe restrictions and works even if framing is blocked.
-    try {
-      const resp = await fetch(`${window.location.origin}/queue/history`, {
-        credentials: 'include',
-        cache: 'no-store',
-      });
-      if (!resp.ok) {
-        lastBackgroundError = `History fetch failed: HTTP ${resp.status}`;
-      } else {
-        const html = await resp.text();
-        const doc = new DOMParser().parseFromString(html, 'text/html');
-        const hasReviewsHeading = !!findHeadingByTextIn(doc, 'Reviews History');
-        const hasGridCells = (doc.querySelectorAll('[role="gridcell"]').length || 0) > 0;
-        if (hasReviewsHeading && hasGridCells) return doc;
-        lastBackgroundError = 'History fetch succeeded, but no rows found in the HTML (likely rendered client-side).';
-      }
-    } catch (e) {
-      lastBackgroundError = `History fetch error: ${String(e?.message || e)}`;
-    }
-
-    // Fallback: hidden iframe (works if the site allows framing and content is same-origin readable).
+    // Preferred: hidden iframe (works if the site allows framing and content is same-origin readable).
+    // We prefer this because it preserves the full SPA behavior (pagination, client-rendered data).
     const domOk = await waitForDomScaffold(timeoutMs);
     if (!domOk) {
       lastBackgroundError = 'Timed out waiting for the page DOM to initialize.';
@@ -609,7 +1257,9 @@
         path = iframe.contentWindow?.location?.pathname || '';
       } catch (e) {
         lastBackgroundError = `Cannot access History iframe (blocked): ${String(e?.message || e)}`;
-        return null;
+        doc = null;
+        path = '';
+        break;
       }
 
       if (doc && doc.readyState !== 'loading') {
@@ -628,8 +1278,29 @@
       }
       await new Promise((r) => setTimeout(r, 350));
     }
-    lastBackgroundError = 'Timed out loading History data in the background.';
-    return null;
+
+    // Last resort: fetch the History HTML with cookies and parse it.
+    // This does NOT support pagination, but can still give a page-1 total.
+    try {
+      const resp = await fetch(`${window.location.origin}/queue/history`, {
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!resp.ok) {
+        lastBackgroundError = `History fetch failed: HTTP ${resp.status}`;
+        return null;
+      }
+      const html = await resp.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const hasReviewsHeading = !!findHeadingByTextIn(doc, 'Reviews History');
+      const hasGridCells = (doc.querySelectorAll('[role="gridcell"]').length || 0) > 0;
+      if (hasReviewsHeading && hasGridCells) return doc;
+      lastBackgroundError = 'History fetch succeeded, but no rows found in the HTML (likely rendered client-side).';
+      return null;
+    } catch (e) {
+      lastBackgroundError = `History fetch error: ${String(e?.message || e)}`;
+      return null;
+    }
   }
 
   function ensureBar() {
@@ -655,6 +1326,10 @@
         </div>
         <div class="tm-details" hidden>
           <div class="tm-meta tm-meta-1"></div>
+          <div class="tm-controls">
+            <label class="tm-label">Date <input type="date" class="tm-date" /></label>
+            <button type="button" class="tm-btn tm-today" title="Set date to today">Today</button>
+          </div>
           <div class="tm-actions">
             <button type="button" class="tm-btn tm-recalc">Recalculate</button>
             <button type="button" class="tm-btn tm-discover" title="Record History API endpoint">Enable Discovery</button>
@@ -727,6 +1402,29 @@
         margin-top: 6px;
         gap: 6px;
       }
+      #${BAR_ID} .tm-controls {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-top: 6px;
+      }
+      #${BAR_ID} .tm-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 14px;
+        opacity: 0.9;
+      }
+      #${BAR_ID} .tm-date {
+        font-size: 14px;
+        padding: 2px 6px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.25);
+        background: rgba(255,255,255,0.10);
+        color: #fff;
+      }
+      #${BAR_ID} .tm-date::-webkit-calendar-picker-indicator { filter: invert(1); opacity: 0.85; }
       #${BAR_ID} .tm-btn {
         font-size: 14px;
         padding: 3px 8px;
@@ -756,6 +1454,23 @@
 
     toggleBtn?.addEventListener('click', () => setDetails(!!details?.hidden));
     bar.querySelector('.tm-recalc')?.addEventListener('click', () => recomputeAndRender({ force: true }));
+    const dateInput = bar.querySelector('.tm-date');
+    const applyDateToUi = () => {
+      const parts = getTargetDayParts();
+      const key = partsToDayKey(parts);
+      if (dateInput && dateInput.value !== key) dateInput.value = key;
+    };
+    applyDateToUi();
+    dateInput?.addEventListener('change', () => {
+      const parts = parseDayKeyToParts(dateInput.value);
+      if (parts) setTargetDayParts(parts);
+      recomputeAndRender({ force: true });
+    });
+    bar.querySelector('.tm-today')?.addEventListener('click', () => {
+      setTargetDayParts(getTodayParts(TODAY_TIME_ZONE));
+      applyDateToUi();
+      recomputeAndRender({ force: true });
+    });
     bar.querySelector('.tm-discover')?.addEventListener('click', () => {
       installNetworkDiscoveryHooks();
       const d = loadDiscovery() || {};
@@ -853,6 +1568,34 @@
   function render({ reviews, questions, note }) {
     const bar = ensureBar();
     if (!bar) return;
+    const target = getTargetDayParts();
+    const dayKey = partsToDayKey(target);
+    const locked = loadBestLock(dayKey);
+    const incomingPayload = {
+      reviews: reviews.sum || 0,
+      questions: questions.sum || 0,
+      countedReviews: reviews.rowsCounted || 0,
+      countedQuestions: questions.rowsCounted || 0,
+    };
+    // Never visually regress below the best known total for the selected day.
+    if (locked && !shouldOverwriteDayCache(locked, incomingPayload)) {
+      reviews = {
+        ...reviews,
+        sum: locked.reviews || 0,
+        rowsCounted: locked.countedReviews || reviews.rowsCounted || 0,
+        rowsSeen: Math.max(reviews.rowsSeen || 0, locked.countedReviews || 0),
+        found: true,
+      };
+      questions = {
+        ...questions,
+        sum: locked.questions || 0,
+        rowsCounted: locked.countedQuestions || questions.rowsCounted || 0,
+        rowsSeen: Math.max(questions.rowsSeen || 0, locked.countedQuestions || 0),
+        found: true,
+      };
+      note = note ? `${note} (holding best total)` : 'Holding best total from cache.';
+    }
+
     const total = reviews.sum + questions.sum;
 
     const setText = (sel, txt) => {
@@ -864,12 +1607,13 @@
     const questionsText = formatMoney(questions.sum);
     const totalText = formatMoney(total);
 
-    const today = getTodayParts(TODAY_TIME_ZONE);
     const tz = TODAY_TIME_ZONE ? ` (${TODAY_TIME_ZONE})` : '';
-    const meta = `Counting rows completed today: ${today.y}-${String(today.m).padStart(2, '0')}-${String(today.d).padStart(2, '0')}${tz}.`;
+    const meta = `Counting rows completed on: ${partsToDayKey(target)}${tz}.`;
+    const paging = lastPagingInfo ? ` ${lastPagingInfo}` : '';
+    const failure = lastApiFailure ? ` API: ${lastApiFailure}` : '';
     const details = reviews.found || questions.found
-      ? `Reviews: ${reviews.rowsCounted}/${reviews.rowsSeen} rows, Questions: ${questions.rowsCounted}/${questions.rowsSeen} rows.`
-      : (note || lastBackgroundError || 'Open the History tab to compute today’s total.');
+      ? `Reviews: ${reviews.rowsCounted}/${reviews.rowsSeen} rows, Questions: ${questions.rowsCounted}/${questions.rowsSeen} rows.${paging}${failure}`
+      : `${note || lastBackgroundError || 'Open the History tab to compute today’s total.'}${paging}${failure}`;
 
     const metaText = `${meta} ${details}`;
 
@@ -894,14 +1638,21 @@
     setText('.tm-total-value', totalText);
     setText('.tm-status', statusText);
     const d = loadDiscovery();
+    const endpointReviewsRaw = d?.endpoints?.reviews ? String(d.endpoints.reviews) : '';
+    const endpointQuestionsRaw = d?.endpoints?.questions ? String(d.endpoints.questions) : '';
+    const endpointReviewsUsable = isUsableApiEndpointUrl(endpointReviewsRaw);
+    const endpointQuestionsUsable = isUsableApiEndpointUrl(endpointQuestionsRaw);
     const endpoints = d?.endpoints
-      ? `Endpoints: reviews=${d.endpoints.reviews ? 'yes' : 'no'}, questions=${d.endpoints.questions ? 'yes' : 'no'}.`
+      ? `Endpoints: reviews=${endpointReviewsRaw ? (endpointReviewsUsable ? 'yes' : 'ignored') : 'no'}, questions=${endpointQuestionsRaw ? (endpointQuestionsUsable ? 'yes' : 'ignored') : 'no'}.` +
+        (endpointReviewsRaw ? ` reviewsUrl=${endpointReviewsRaw}` : '') +
+        (endpointQuestionsRaw ? ` questionsUrl=${endpointQuestionsRaw}` : '')
       : 'Endpoints: none.';
     const parsed = d?.lastParsed
-      ? ` Last parsed: ${new Date(d.lastParsed.at).toLocaleString()} (items=${d.lastParsed.items || 0}, reviewItems=${d.lastParsed.reviewItems || 0}, questionItems=${d.lastParsed.questionItems || 0}, today: ${d.lastParsed.countedReviews || 0} reviews / ${d.lastParsed.countedQuestions || 0} questions).`
+      ? ` Last parsed: ${new Date(d.lastParsed.at).toLocaleString()} (items=${d.lastParsed.items || 0}, reviewItems=${d.lastParsed.reviewItems || 0}, questionItems=${d.lastParsed.questionItems || 0}, selected day: ${d.lastParsed.countedReviews || 0} reviews / ${d.lastParsed.countedQuestions || 0} questions, url=${d.lastParsed.url || ''}, keyHints=${Array.isArray(d.lastParsed.keyHints) ? d.lastParsed.keyHints.join(',') : ''}).`
       : '';
+    const lockMeta = locked ? ` BestLock=${formatMoney((locked.reviews || 0) + (locked.questions || 0))}.` : ' BestLock=none.';
     const src = ` Source: ${lastDataSource}.`;
-    setText('.tm-meta-1', `${metaText} ${endpoints}${parsed}${src}`);
+    setText('.tm-meta-1', `${metaText} ${endpoints}${parsed}${lockMeta}${src}`);
 
     // Keep the bar aligned above the bottom-right box as the page changes.
     positionBar(bar);
@@ -909,6 +1660,432 @@
 
   let historyDocPromise = null;
   let historyDoc = null;
+  let lastPagingInfo = '';
+
+  function pickFirstDefined(...vals) {
+    for (const v of vals) if (v != null) return v;
+    return null;
+  }
+
+  function toAbsoluteUrlMaybe(u, base) {
+    if (!u || typeof u !== 'string') return null;
+    try {
+      return new URL(u, base || window.location.origin).toString();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function looksLikeUrlishString(s) {
+    if (!s || typeof s !== 'string') return false;
+    const t = s.trim();
+    if (!t) return false;
+    if (t.startsWith('http://') || t.startsWith('https://')) return true;
+    if (t.startsWith('/')) return true;
+    return false;
+  }
+
+  function findNextUrlInPayload(payload, baseUrl) {
+    // Common REST pagination shapes.
+    const nextCandidate = pickFirstDefined(
+      payload?.next,
+      payload?.links?.next,
+      payload?._links?.next?.href,
+      payload?.pagination?.next,
+      payload?.pagination?.nextUrl,
+      payload?.pagination?.next_url,
+      payload?.meta?.next,
+      payload?.meta?.nextUrl,
+      payload?.meta?.next_url
+    );
+    if (typeof nextCandidate === 'string') return toAbsoluteUrlMaybe(nextCandidate, baseUrl);
+    if (nextCandidate && typeof nextCandidate === 'object' && typeof nextCandidate.href === 'string') {
+      return toAbsoluteUrlMaybe(nextCandidate.href, baseUrl);
+    }
+
+    // Fallback: deep-walk for any "next*" link-like field.
+    // We keep it conservative: key must include "next", value must look URL-ish.
+    const stack = [payload];
+    const seen = new Set();
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== 'object') continue;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      if (Array.isArray(cur)) {
+        for (const v of cur) stack.push(v);
+        continue;
+      }
+      for (const k of Object.keys(cur)) {
+        const v = cur[k];
+        if (k && typeof k === 'string' && k.toLowerCase().includes('next')) {
+          if (typeof v === 'string' && looksLikeUrlishString(v)) {
+            return toAbsoluteUrlMaybe(v, baseUrl);
+          }
+          if (v && typeof v === 'object') {
+            const href = typeof v.href === 'string' ? v.href : null;
+            const url = typeof v.url === 'string' ? v.url : null;
+            const link = typeof v.link === 'string' ? v.link : null;
+            const s = href || url || link;
+            if (s && looksLikeUrlishString(s)) return toAbsoluteUrlMaybe(s, baseUrl);
+          }
+        }
+        stack.push(v);
+      }
+    }
+    return null;
+  }
+
+  function findCursorPageInfo(payload) {
+    // Looks for GraphQL-like pageInfo { hasNextPage, endCursor } anywhere in the payload.
+    const stack = [payload];
+    const seen = new Set();
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== 'object') continue;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      if (Array.isArray(cur)) {
+        for (const v of cur) stack.push(v);
+        continue;
+      }
+      if (cur.pageInfo && typeof cur.pageInfo === 'object') {
+        const pi = cur.pageInfo;
+        const hasNext = typeof pi.hasNextPage === 'boolean' ? pi.hasNextPage : null;
+        const endCursor = typeof pi.endCursor === 'string' ? pi.endCursor : null;
+        if (endCursor) return { hasNext, endCursor };
+      }
+      const hasNext = typeof cur.hasNextPage === 'boolean' ? cur.hasNextPage : null;
+      const endCursor = typeof cur.endCursor === 'string' ? cur.endCursor : null;
+      const nextCursor = typeof cur.nextCursor === 'string' ? cur.nextCursor : null;
+      const next_cursor = typeof cur.next_cursor === 'string' ? cur.next_cursor : null;
+      if (endCursor || nextCursor || next_cursor) {
+        return { hasNext, endCursor: endCursor || nextCursor || next_cursor };
+      }
+      for (const k of Object.keys(cur)) stack.push(cur[k]);
+    }
+    return null;
+  }
+
+  function cloneJson(obj) {
+    try { return JSON.parse(JSON.stringify(obj)); } catch (_) { return null; }
+  }
+
+  function updateGraphqlCursorVars(body, endCursor) {
+    if (!body || typeof body !== 'object' || !endCursor) return body;
+    const b = cloneJson(body) || body;
+    b.variables = (b.variables && typeof b.variables === 'object') ? b.variables : {};
+    const keys = ['after', 'cursor', 'pageCursor', 'page_cursor', 'endCursor', 'end_cursor', 'starting_after', 'startingAfter'];
+    let changed = false;
+    for (const k of keys) {
+      if (k in b.variables) {
+        b.variables[k] = endCursor;
+        changed = true;
+      }
+    }
+    if (!changed) {
+      // Add a common cursor var if none exists.
+      b.variables.after = endCursor;
+    }
+    return b;
+  }
+
+  async function fetchGraphqlItemsForDayPaginated({ request, fallbackType, targetDayParts }) {
+    const MAX_PAGES = 60;
+    const SLEEP_MS = 150;
+    const target = targetDayParts || getTargetDayParts();
+    const url = request?.url;
+    const baseBody = request?.body;
+    if (!url || !baseBody || typeof baseBody !== 'object') throw new Error('No GraphQL request captured yet');
+
+    let body = cloneJson(baseBody) || baseBody;
+    let page = 0;
+    const matched = [];
+
+    while (page < MAX_PAGES) {
+      const resp = await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: {
+          'content-type': 'application/json',
+          ...(request.headers || {}),
+        },
+        body: JSON.stringify(body),
+      });
+      const ct = (resp.headers.get('content-type') || '').toLowerCase();
+      if (!resp.ok) throw new Error(`GraphQL HTTP ${resp.status}`);
+      if (!ct.includes('application/json')) throw new Error('GraphQL not JSON');
+      const json = await resp.json();
+
+      const items = extractItemsFromAny(json, fallbackType);
+      for (const it of items) {
+        const parts = getPartsForDate(it.completedDate, TODAY_TIME_ZONE);
+        if (sameYMD(parts, target)) matched.push(it);
+      }
+
+      const cursorInfo = findCursorPageInfo(json);
+      if (!cursorInfo?.endCursor || cursorInfo.hasNext === false) break;
+      body = updateGraphqlCursorVars(body, cursorInfo.endCursor);
+
+      page += 1;
+      await new Promise((r) => setTimeout(r, SLEEP_MS));
+    }
+
+    return { items: matched, pagesFetched: page + 1 };
+  }
+
+  function parseLinkHeaderForRelNext(linkHeader, baseUrl) {
+    // RFC 5988-ish: <url>; rel="next", <url2>; rel="prev"
+    if (!linkHeader || typeof linkHeader !== 'string') return null;
+    const parts = linkHeader.split(',').map((s) => s.trim()).filter(Boolean);
+    for (const p of parts) {
+      const m = p.match(/<([^>]+)>\s*;\s*rel\s*=\s*"?next"?/i);
+      if (m && m[1]) return toAbsoluteUrlMaybe(m[1], baseUrl);
+    }
+    return null;
+  }
+
+  function findNextUrlInHeaders(headers, baseUrl) {
+    if (!headers) return null;
+    try {
+      const link = headers.get?.('link') || headers.get?.('Link') || '';
+      const fromLink = parseLinkHeaderForRelNext(link, baseUrl);
+      if (fromLink) return fromLink;
+
+      const candidates = [
+        headers.get?.('x-next-page'),
+        headers.get?.('X-Next-Page'),
+        headers.get?.('x-next'),
+        headers.get?.('X-Next'),
+        headers.get?.('x-next-url'),
+        headers.get?.('X-Next-Url'),
+      ].filter(Boolean);
+      for (const c of candidates) {
+        if (typeof c === 'string' && looksLikeUrlishString(c)) return toAbsoluteUrlMaybe(c, baseUrl);
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function deriveNextUrlFromQueryPaging(currentUrl, pageIndex, cursorInfo) {
+    // Try to increment ?page=, or bump ?offset= by ?limit=, or set a cursor param.
+    let u;
+    try {
+      u = new URL(currentUrl, window.location.origin);
+    } catch (_) {
+      return null;
+    }
+    const sp = u.searchParams;
+
+    // Cursor-based (when URL already has a cursor/after param).
+    if (cursorInfo?.endCursor) {
+      const cursorKeys = ['cursor', 'after', 'starting_after', 'startingAfter', 'page_cursor', 'pageCursor', 'endCursor'];
+      for (const k of cursorKeys) {
+        if (sp.has(k)) {
+          sp.set(k, cursorInfo.endCursor);
+          return u.toString();
+        }
+      }
+      // If we have cursor info but no cursor param in the URL, try the most common one.
+      // Most servers ignore unknown query params, so this is usually safe.
+      if (cursorInfo.hasNext !== false) {
+        sp.set('after', cursorInfo.endCursor);
+        sp.set('cursor', cursorInfo.endCursor);
+        sp.set('pageCursor', cursorInfo.endCursor);
+        sp.set('page_cursor', cursorInfo.endCursor);
+        return u.toString();
+      }
+    }
+
+    // Page-based.
+    if (sp.has('page')) {
+      const cur = Number(sp.get('page'));
+      if (Number.isFinite(cur)) {
+        sp.set('page', String(cur + 1));
+        return u.toString();
+      }
+      sp.set('page', String(pageIndex + 2)); // fall back if page isn't numeric
+      return u.toString();
+    }
+    if (sp.has('pageNumber')) {
+      const cur = Number(sp.get('pageNumber'));
+      if (Number.isFinite(cur)) {
+        sp.set('pageNumber', String(cur + 1));
+        return u.toString();
+      }
+    }
+    if (sp.has('page[number]')) {
+      const cur = Number(sp.get('page[number]'));
+      if (Number.isFinite(cur)) {
+        sp.set('page[number]', String(cur + 1));
+        return u.toString();
+      }
+    }
+
+    // Offset/limit-based.
+    if (sp.has('offset')) {
+      const offset = Number(sp.get('offset'));
+      const limit = Number(sp.get('limit') || sp.get('per_page') || sp.get('perPage') || sp.get('pageSize') || sp.get('page_size'));
+      if (Number.isFinite(offset) && Number.isFinite(limit) && limit > 0) {
+        sp.set('offset', String(offset + limit));
+        return u.toString();
+      }
+      // If no limit, at least try moving by 50.
+      if (Number.isFinite(offset)) {
+        sp.set('offset', String(offset + 50));
+        if (!sp.has('limit')) sp.set('limit', '50');
+        return u.toString();
+      }
+    }
+
+    return null;
+  }
+
+  async function fetchItemsForDayPaginated({ url, type, targetDayParts }) {
+    const MAX_PAGES = 60;
+    const SLEEP_MS = 150;
+    const target = targetDayParts || getTargetDayParts();
+
+    let curUrl = url;
+    let page = 0;
+    const seenUrls = new Set();
+    const matched = [];
+    let sawTarget = false;
+    let lastPageHadTarget = false;
+    let stoppedBecauseNoNext = false;
+
+    async function fetchJsonPage(pageUrl, allowSoftFail) {
+      try {
+        const resp = await fetch(pageUrl, { credentials: 'include', cache: 'no-store' });
+        const ct = (resp.headers.get('content-type') || '').toLowerCase();
+        if (!resp.ok) {
+          if (allowSoftFail) return null;
+          throw new Error(`API HTTP ${resp.status} for ${pageUrl}`);
+        }
+        if (!ct.includes('application/json')) {
+          if (allowSoftFail) return null;
+          throw new Error(`API not JSON for ${pageUrl}`);
+        }
+        const json = await resp.json();
+        const nextFromHeaders = findNextUrlInHeaders(resp.headers, pageUrl);
+        return { json, nextFromHeaders };
+      } catch (e) {
+        if (allowSoftFail) return null;
+        throw e;
+      }
+    }
+
+    while (curUrl && page < MAX_PAGES) {
+      if (seenUrls.has(curUrl)) break;
+      seenUrls.add(curUrl);
+
+      const pageResp = await fetchJsonPage(curUrl, page > 0 /* allowSoftFail */);
+      if (!pageResp) break;
+      const { json, nextFromHeaders } = pageResp;
+      const items = extractItemsFromAny(json, type);
+      if (!items.length) break;
+
+      let maxParts = null;
+      lastPageHadTarget = false;
+      for (const it of items) {
+        const parts = getPartsForDate(it.completedDate, TODAY_TIME_ZONE);
+        if (!maxParts || compareYMD(parts, maxParts) > 0) maxParts = parts;
+        if (sameYMD(parts, target)) {
+          matched.push(it);
+          sawTarget = true;
+          lastPageHadTarget = true;
+        }
+      }
+
+      // Stop only when the entire page is older than the target day.
+      // (Some APIs interleave older items on a page, so we must NOT stop just because the page contains any older rows.)
+      if (maxParts && compareYMD(maxParts, target) < 0) {
+        break;
+      }
+
+      const cursorInfo = findCursorPageInfo(json);
+      const nextFromPayload = findNextUrlInPayload(json, curUrl);
+      const nextFromQuery = deriveNextUrlFromQueryPaging(curUrl, page, cursorInfo);
+      const candidates = [nextFromHeaders, nextFromPayload, nextFromQuery].filter(Boolean);
+      // If the page had target rows but we can't find a next URL, don't pretend we're complete.
+      // We'll stop, but the UI will indicate pagination was incomplete.
+      const nextUrl = candidates.find((u) => u && u !== curUrl) || null;
+      if (!nextUrl) {
+        stoppedBecauseNoNext = true;
+        break;
+      }
+
+      curUrl = nextUrl;
+      page += 1;
+      await new Promise((r) => setTimeout(r, SLEEP_MS));
+    }
+
+    return { items: matched, pagesFetched: page + 1, sawTarget, lastPageHadTarget, stoppedBecauseNoNext };
+  }
+
+  function loadDayCache(cache, dayKey) {
+    if (!cache || typeof cache !== 'object') return null;
+    const byDayVal = (cache.byDay && typeof cache.byDay === 'object' && cache.byDay[dayKey]) ? cache.byDay[dayKey] : null;
+    const bestVal = (cache.bestByDay && typeof cache.bestByDay === 'object' && cache.bestByDay[dayKey]) ? cache.bestByDay[dayKey] : null;
+    const lockVal = loadBestLock(dayKey);
+    if (byDayVal || bestVal || lockVal) {
+      let winner = byDayVal || null;
+      if (!winner || shouldOverwriteDayCache(winner, bestVal)) winner = bestVal || winner;
+      if (!winner || shouldOverwriteDayCache(winner, lockVal)) winner = lockVal || winner;
+      return winner;
+    }
+    // Legacy format: single "today" payload
+    if (cache.today && sameYMD(cache.today, parseDayKeyToParts(dayKey))) {
+      return {
+        reviews: cache.reviews,
+        questions: cache.questions,
+        countedReviews: cache.countedReviews,
+        countedQuestions: cache.countedQuestions,
+      };
+    }
+    return null;
+  }
+
+  function saveDayCache(dayKey, payload) {
+    const existing = loadCache() || {};
+    const byDay = (existing.byDay && typeof existing.byDay === 'object') ? existing.byDay : {};
+    const bestByDay = (existing.bestByDay && typeof existing.bestByDay === 'object') ? existing.bestByDay : {};
+    byDay[dayKey] = {
+      reviews: payload.reviews || 0,
+      questions: payload.questions || 0,
+      countedReviews: payload.countedReviews || 0,
+      countedQuestions: payload.countedQuestions || 0,
+      at: Date.now(),
+    };
+    const prevBest = bestByDay[dayKey] || null;
+    const nextVal = byDay[dayKey];
+    bestByDay[dayKey] = shouldOverwriteDayCache(prevBest, nextVal) ? nextVal : prevBest;
+    saveBestLock(dayKey, nextVal);
+    // Keep the object bounded.
+    const keys = Object.keys(byDay).sort((a, b) => (a < b ? 1 : -1));
+    for (const k of keys.slice(31)) delete byDay[k];
+    const bestKeys = Object.keys(bestByDay).sort((a, b) => (a < b ? 1 : -1));
+    for (const k of bestKeys.slice(31)) delete bestByDay[k];
+    saveCache({ ...existing, at: Date.now(), byDay, bestByDay });
+  }
+
+  function shouldOverwriteDayCache(existingDay, nextDay) {
+    // Prevent overwriting a "fuller" day total with a partial one.
+    if (!nextDay) return false;
+    if (!existingDay) return true;
+    const exCount = (existingDay.countedReviews || 0) + (existingDay.countedQuestions || 0);
+    const nxCount = (nextDay.countedReviews || 0) + (nextDay.countedQuestions || 0);
+    const exSum = (existingDay.reviews || 0) + (existingDay.questions || 0);
+    const nxSum = (nextDay.reviews || 0) + (nextDay.questions || 0);
+    // If totals differ, trust the larger total. This protects multi-page history totals.
+    if (nxSum > exSum + 0.0001) return true;
+    if (nxSum + 0.0001 < exSum) return false;
+    // If totals tie, use counts as tiebreaker.
+    if (nxCount > exCount) return true;
+    if (nxCount < exCount) return false;
+    return true;
+  }
 
   async function recomputeAndRender({ force = false } = {}) {
     if (recomputeInFlight) {
@@ -919,17 +2096,62 @@
     try {
       const discovery = loadDiscovery();
       const cache = loadCache();
-      const today = getTodayParts(TODAY_TIME_ZONE);
-      const cacheMatchesToday = cache && cache.today && sameYMD(cache.today, today);
+      const targetDay = getTargetDayParts();
+      const dayKey = partsToDayKey(targetDay);
+      const dayCache = loadDayCache(cache, dayKey);
+      if (dayCache) saveBestLock(dayKey, dayCache);
+
+      // On the History page, ALWAYS compute from the History UI (and paginate it).
+      // This prevents a broken/false-positive API endpoint from overriding correct History totals.
+      if (isHistoryRoute()) {
+        installNetworkDiscoveryHooks();
+        historyDoc = document;
+        historyDocPromise = null;
+
+        const reviews = await computeSectionSumPaginatedIn(historyDoc, {
+          startHeadingText: 'Reviews History',
+          endHeadingText: 'Question History',
+          rowTerminatorRe: /^View review$/i,
+        });
+        const questions = await computeSectionSumPaginatedIn(historyDoc, {
+          startHeadingText: 'Question History',
+          endHeadingText: null,
+          rowTerminatorRe: /^View question$/i,
+        });
+
+        lastStatus = (reviews.found || questions.found) ? 'ready' : 'error';
+        if (lastStatus === 'error' && !lastBackgroundError) {
+          lastBackgroundError = 'History data loaded, but could not locate expected rows.';
+        }
+        if (lastStatus === 'ready') {
+          lastDataSource = 'history';
+          const rp = reviews?.pages || 1;
+          const qp = questions?.pages || 1;
+          lastPagingInfo = `Paged History: R ${rp}p, Q ${qp}p.`;
+          lastApiFailure = '';
+          saveDayCache(dayKey, {
+            reviews: reviews.sum,
+            questions: questions.sum,
+            countedReviews: reviews.rowsCounted,
+            countedQuestions: questions.rowsCounted,
+          });
+        }
+        render({ reviews, questions, note: '' });
+        return;
+      }
 
       // Best path (no History visit needed *after initial discovery*):
       // call the discovered API endpoints directly and compute totals.
-      if (!isHistoryRoute() && isApiReady(discovery)) {
+      // Important: allow API mode even on /queue/history, and even if only one endpoint is known.
+      // This avoids "page 1 only" History DOM limitations.
+      if (hasAnyApiEndpoint(discovery) || discovery?.graphql?.reviews || discovery?.graphql?.questions || discovery?.graphql?.last) {
         try {
           if (!force && Date.now() - lastApiFetchAt < 15_000) return; // throttle
           lastApiFetchAt = Date.now();
           lastStatus = 'loading';
           lastDataSource = 'api';
+          lastPagingInfo = '';
+          lastApiFailure = '';
           render({
             reviews: { sum: 0, found: false, rowsCounted: 0, rowsSeen: 0 },
             questions: { sum: 0, found: false, rowsCounted: 0, rowsSeen: 0 },
@@ -937,83 +2159,120 @@
           });
 
           const urls = [
-            discovery.endpoints.reviews ? { type: 'review', url: discovery.endpoints.reviews } : null,
-            discovery.endpoints.questions ? { type: 'question', url: discovery.endpoints.questions } : null,
+            isUsableApiEndpointUrl(discovery.endpoints.reviews) ? { type: 'review', url: discovery.endpoints.reviews } : null,
+            isUsableApiEndpointUrl(discovery.endpoints.questions) ? { type: 'question', url: discovery.endpoints.questions } : null,
           ].filter(Boolean);
 
           let items = [];
+          let reviewPages = 0;
+          let questionPages = 0;
+          let incomplete = false;
           for (const entry of urls) {
-            const resp = await fetch(entry.url, { credentials: 'include', cache: 'no-store' });
-            const ct = (resp.headers.get('content-type') || '').toLowerCase();
-            if (!resp.ok) throw new Error(`API HTTP ${resp.status} for ${entry.url}`);
-            if (!ct.includes('application/json')) throw new Error(`API not JSON for ${entry.url}`);
-            const json = await resp.json();
-            items = items.concat(extractItemsFromAny(json, entry.type));
+            const paged = await fetchItemsForDayPaginated({ url: entry.url, type: entry.type, targetDayParts: targetDay });
+            items = items.concat(paged.items);
+            if (entry.type === 'review') reviewPages = paged.pagesFetched || 0;
+            if (entry.type === 'question') questionPages = paged.pagesFetched || 0;
+            if (paged.stoppedBecauseNoNext && paged.lastPageHadTarget) incomplete = true;
           }
 
-          const totals = computeTotalsFromItems(items);
+          // If REST endpoints are unusable/missing, try captured GraphQL from History page.
+          if (!urls.length) {
+            const gql = discovery?.graphql || {};
+            if (gql.reviews) {
+              const paged = await fetchGraphqlItemsForDayPaginated({ request: gql.reviews, fallbackType: 'review', targetDayParts: targetDay });
+              items = items.concat(paged.items);
+              reviewPages = paged.pagesFetched || 0;
+            }
+            if (gql.questions) {
+              const paged = await fetchGraphqlItemsForDayPaginated({ request: gql.questions, fallbackType: 'question', targetDayParts: targetDay });
+              items = items.concat(paged.items);
+              questionPages = paged.pagesFetched || 0;
+            }
+            if (!gql.reviews && !gql.questions && gql.last) {
+              const paged = await fetchGraphqlItemsForDayPaginated({ request: gql.last, fallbackType: undefined, targetDayParts: targetDay });
+              items = items.concat(paged.items);
+            }
+          }
+
+          const totals = computeTotalsFromItems(items, targetDay);
+          const apiCounts = (totals.countedReviews || 0) + (totals.countedQuestions || 0);
+
+          // If API parsing yielded 0 items for the selected day, do NOT show $0.00 as a final answer.
+          // Fall back to History scanning (which can paginate the UI) or background History fetch.
+          if (apiCounts === 0) {
+            lastStatus = 'error';
+            lastDataSource = 'api';
+            lastPagingInfo = `Paged API: R ${reviewPages || 1}p, Q ${questionPages || 1}p${incomplete ? ' (may be missing more—no next link found)' : ''}.`;
+            lastBackgroundError = 'API returned 0 parsed items for the selected day; falling back to History scan.';
+            lastApiFailure = '0 parsed items';
+            throw new Error('API returned 0 parsed items');
+          }
+
           lastStatus = 'ready';
           lastBackgroundError = '';
           lastDataSource = 'api';
+          lastPagingInfo = `Paged API: R ${reviewPages || 1}p, Q ${questionPages || 1}p${incomplete ? ' (may be missing more—no next link found)' : ''}.`;
 
-          const apiCounts = (totals.countedReviews || 0) + (totals.countedQuestions || 0);
-          const cacheCounts = cacheMatchesToday
-            ? ((cache.countedReviews || 0) + (cache.countedQuestions || 0))
+          const cacheCounts = dayCache
+            ? ((dayCache.countedReviews || 0) + (dayCache.countedQuestions || 0))
             : 0;
 
-          // If API returns 0 items today but cache has data, prefer cache and don't overwrite it.
-          if (apiCounts === 0 && cacheCounts > 0) {
+          // If API returns 0 items for the selected day but cache has data:
+          // - on Overview: show cache (fast, avoids flashing 0)
+          // - on History: fall through and compute by paginating the History UI (handles multi-page days)
+          if (apiCounts === 0 && cacheCounts > 0 && !isHistoryRoute() && !force) {
             lastStatus = 'ready';
             lastDataSource = 'cache';
             render({
-              reviews: { sum: cache.reviews || 0, found: true, rowsCounted: cache.countedReviews || 0, rowsSeen: cache.countedReviews || 0 },
-              questions: { sum: cache.questions || 0, found: true, rowsCounted: cache.countedQuestions || 0, rowsSeen: cache.countedQuestions || 0 },
+              reviews: { sum: dayCache.reviews || 0, found: true, rowsCounted: dayCache.countedReviews || 0, rowsSeen: dayCache.countedReviews || 0 },
+              questions: { sum: dayCache.questions || 0, found: true, rowsCounted: dayCache.countedQuestions || 0, rowsSeen: dayCache.countedQuestions || 0 },
               note: 'API returned 0 for today; showing cached totals.',
             });
             return;
           }
 
-          // Only overwrite cache when API result is meaningful for today, or cache is absent.
-          if (apiCounts > 0 || !cacheMatchesToday) {
-            saveCache({
-              at: Date.now(),
-              today,
-              reviews: totals.reviews,
-              questions: totals.questions,
-              countedReviews: totals.countedReviews,
-              countedQuestions: totals.countedQuestions,
-            });
+          // Only overwrite cache when it improves/extends what we already have.
+          if (shouldOverwriteDayCache(dayCache, totals)) {
+            saveDayCache(dayKey, totals);
           }
+          saveBestLock(dayKey, totals);
           render({
             reviews: { sum: totals.reviews, found: true, rowsCounted: totals.countedReviews, rowsSeen: totals.countedReviews },
             questions: { sum: totals.questions, found: true, rowsCounted: totals.countedQuestions, rowsSeen: totals.countedQuestions },
-            note: '',
+            note: (hasApiEndpoint(discovery, 'question') ? '' : 'Questions endpoint not discovered yet; questions total may be incomplete.'),
           });
           return;
         } catch (e) {
           lastStatus = 'error';
           lastBackgroundError = `API mode failed: ${String(e?.message || e)}`;
+          lastPagingInfo = '';
+          lastApiFailure = String(e?.message || e);
           // fall through to other methods
         }
       }
 
-      // If API is not ready yet (missing an endpoint), show today's cached totals if we have them.
-      if (!isHistoryRoute() && !isApiReady(discovery) && cacheMatchesToday) {
-        lastStatus = 'ready';
+      // If API isn't usable yet but we have cache, show cache immediately,
+      // then continue and try to compute from History in the background (so multi-page days get accumulated).
+      if (!hasAnyApiEndpoint(discovery) && dayCache && !force) {
+        lastStatus = 'loading';
         lastDataSource = 'cache';
         lastBackgroundError = '';
+        lastPagingInfo = '';
+        lastApiFailure = '';
         render({
-          reviews: { sum: cache.reviews || 0, found: true, rowsCounted: cache.countedReviews || 0, rowsSeen: cache.countedReviews || 0 },
-          questions: { sum: cache.questions || 0, found: true, rowsCounted: cache.countedQuestions || 0, rowsSeen: cache.countedQuestions || 0 },
-          note: 'API discovery incomplete; showing cached totals.',
+          reviews: { sum: dayCache.reviews || 0, found: true, rowsCounted: dayCache.countedReviews || 0, rowsSeen: dayCache.countedReviews || 0 },
+          questions: { sum: dayCache.questions || 0, found: true, rowsCounted: dayCache.countedQuestions || 0, rowsSeen: dayCache.countedQuestions || 0 },
+          note: 'Updating from History…',
         });
-        return;
+        // fall through (do not return)
       }
 
       // Prefer computing directly from the History page if we're on it.
       if (isHistoryRoute()) {
         // Ensure hooks are installed before/while History loads.
         installNetworkDiscoveryHooks();
+        // On the History page, prefer the *live* document.
+        // This avoids iframe rendering differences and ensures the paginator is acting on the same UI you see.
         historyDoc = document;
         historyDocPromise = null;
       } else if (!historyDoc || force) {
@@ -1022,20 +2281,23 @@
       }
 
       if (!historyDoc) {
-        // If we have a cache for today, show it instead of 0.
-        if (cacheMatchesToday) {
+        // If we're on History and couldn't access it, don't silently show cache as "truth".
+        // Otherwise it looks like paging isn't adding anything.
+        if (dayCache && !isHistoryRoute()) {
           lastStatus = 'ready';
           lastDataSource = 'cache';
           lastBackgroundError = '';
+          lastPagingInfo = '';
           render({
-            reviews: { sum: cache.reviews || 0, found: true, rowsCounted: cache.countedReviews || 0, rowsSeen: cache.countedReviews || 0 },
-            questions: { sum: cache.questions || 0, found: true, rowsCounted: cache.countedQuestions || 0, rowsSeen: cache.countedQuestions || 0 },
+            reviews: { sum: dayCache.reviews || 0, found: true, rowsCounted: dayCache.countedReviews || 0, rowsSeen: dayCache.countedReviews || 0 },
+            questions: { sum: dayCache.questions || 0, found: true, rowsCounted: dayCache.countedQuestions || 0, rowsSeen: dayCache.countedQuestions || 0 },
             note: '',
           });
           return;
         }
         lastStatus = lastBackgroundError ? 'error' : 'loading';
         lastDataSource = 'none';
+        lastPagingInfo = '';
         render({
           reviews: { sum: 0, found: false, rowsCounted: 0, rowsSeen: 0 },
           questions: { sum: 0, found: false, rowsCounted: 0, rowsSeen: 0 },
@@ -1044,16 +2306,30 @@
         return;
       }
 
-      const reviews = computeSectionSumIn(historyDoc, {
+      const reviews = await computeSectionSumPaginatedIn(historyDoc, {
         startHeadingText: 'Reviews History',
         endHeadingText: 'Question History',
         rowTerminatorRe: /^View review$/i,
       });
-      const questions = computeSectionSumIn(historyDoc, {
+      const questions = await computeSectionSumPaginatedIn(historyDoc, {
         startHeadingText: 'Question History',
         endHeadingText: null,
         rowTerminatorRe: /^View question$/i,
       });
+
+      // If History parsing fails but we have cache for the day, keep showing cache (avoid ERR/0 flicker).
+      if (!(reviews.found || questions.found) && dayCache) {
+        lastStatus = 'ready';
+        lastDataSource = 'cache';
+        lastBackgroundError = 'History parse failed; showing cached totals.';
+        lastPagingInfo = '';
+        render({
+          reviews: { sum: dayCache.reviews || 0, found: true, rowsCounted: dayCache.countedReviews || 0, rowsSeen: dayCache.countedReviews || 0 },
+          questions: { sum: dayCache.questions || 0, found: true, rowsCounted: dayCache.countedQuestions || 0, rowsSeen: dayCache.countedQuestions || 0 },
+          note: '',
+        });
+        return;
+      }
 
       lastStatus = (reviews.found || questions.found) ? 'ready' : 'error';
       if (lastStatus === 'error' && !lastBackgroundError) {
@@ -1061,14 +2337,29 @@
       }
       if (lastStatus === 'ready') {
         lastDataSource = 'history';
-        saveCache({
-          at: Date.now(),
-          today,
+        const rp = reviews?.pages || 1;
+        const qp = questions?.pages || 1;
+        lastPagingInfo = `Paged History: R ${rp}p, Q ${qp}p.`;
+        const nextDay = {
           reviews: reviews.sum,
           questions: questions.sum,
           countedReviews: reviews.rowsCounted,
           countedQuestions: questions.rowsCounted,
-        });
+        };
+        saveBestLock(dayKey, nextDay);
+        // Never regress the displayed total beneath the best cached value for this day.
+        if (dayCache && !shouldOverwriteDayCache(dayCache, nextDay)) {
+          render({
+            reviews: { sum: dayCache.reviews || 0, found: true, rowsCounted: dayCache.countedReviews || 0, rowsSeen: dayCache.countedReviews || 0 },
+            questions: { sum: dayCache.questions || 0, found: true, rowsCounted: dayCache.countedQuestions || 0, rowsSeen: dayCache.countedQuestions || 0 },
+            note: 'Using best cached total while history recheck runs.',
+          });
+          return;
+        }
+        // If History actually paged across >1 review page, treat it as authoritative for the day.
+        if (rp > 1 || shouldOverwriteDayCache(dayCache, nextDay)) {
+          saveDayCache(dayKey, nextDay);
+        }
       }
       render({ reviews, questions, note: '' });
     } finally {
