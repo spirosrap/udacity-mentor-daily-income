@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Udacity Mentor Dashboard — Daily Income Counter
 // @namespace    https://mentor-dashboard.udacity.com/
-// @version      1.0.0
-// @description  Sum today's earned income from Reviews + Questions and show it at the bottom of the page.
+// @version      1.1.0
+// @description  Sum today's earned income from Reviews + Questions and show totals with completed counts at the bottom of the page.
 // @match        https://mentor-dashboard.udacity.com/queue/*
 // @run-at       document-start
 // @grant        none
@@ -1351,7 +1351,7 @@
       #${BAR_ID} .tm-inner {
         pointer-events: auto;
         width: max-content;
-        max-width: 360px;
+        max-width: 460px;
         margin: 0;
         background: rgba(20, 24, 30, 0.92);
         color: #fff;
@@ -1603,9 +1603,18 @@
       if (el && el.textContent !== txt) el.textContent = txt;
     };
 
-    const reviewsText = formatMoney(reviews.sum);
-    const questionsText = formatMoney(questions.sum);
-    const totalText = formatMoney(total);
+    const normalizeCount = (value) => {
+      const n = Number(value);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+    };
+    const reviewsCount = normalizeCount(reviews.rowsCounted);
+    const questionsCount = normalizeCount(questions.rowsCounted);
+    const totalCount = reviewsCount + questionsCount;
+    const formatMoneyWithCount = (amount, count) => `${formatMoney(amount)} (${count})`;
+
+    const reviewsText = formatMoneyWithCount(reviews.sum, reviewsCount);
+    const questionsText = formatMoneyWithCount(questions.sum, questionsCount);
+    const totalText = formatMoneyWithCount(total, totalCount);
 
     const tz = TODAY_TIME_ZONE ? ` (${TODAY_TIME_ZONE})` : '';
     const meta = `Counting rows completed on: ${partsToDayKey(target)}${tz}.`;
@@ -2452,4 +2461,3 @@
     domObs.observe(document.documentElement, { childList: true, subtree: true });
   }
 })();
-
