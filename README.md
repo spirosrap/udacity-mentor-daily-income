@@ -1,6 +1,6 @@
 # Udacity Mentor Dashboard — Daily Income Counter (Tampermonkey)
 
-A Tampermonkey userscript that calculates **today’s income (USD)** from **Reviews + Questions** on Udacity’s Mentor Dashboard and shows it as a small pill near the bottom-right of the page.
+A Tampermonkey userscript that calculates **today’s income (USD)** from **Reviews + Questions** on Udacity’s Mentor Dashboard and shows it as a small pill near the bottom-right of the page, including per-type completed counts.
 
 - **Script file**: `udacity-mentor-daily-income.user.js`
 - **Runs on**: `https://mentor-dashboard.udacity.com/queue/*`
@@ -18,9 +18,9 @@ A Tampermonkey userscript that calculates **today’s income (USD)** from **Revi
 
 A compact pill showing:
 
-- **R**: Reviews income today
-- **Q**: Questions income today
-- **T**: Total income today
+- **R**: Reviews income + count for the selected date (example: `$150.00 (10)`)
+- **Q**: Questions income + count for the selected date (example: `$30.00 (3)`)
+- **T**: Total income + combined count (example: `$180.00 (13)`)
 - **OK / … / ERR**: status indicator (ready / loading / error)
 
 Click **`i`** to open details and see debug info (endpoints discovered, last parse time, data source, etc).
@@ -72,4 +72,3 @@ Refresh the page. The script re-measures and re-positions during rendering and o
 - The script runs locally in your browser.
 - It does **not** send data anywhere.
 - It stores small bits of state in `localStorage` (cached totals + discovery/debug metadata).
-
